@@ -47,14 +47,21 @@ After the first mail was processed the keys for the processed rules should appea
 
 The plugin has the following configuration options:
 
-timing_redis_server (default: '127.0.0.1:6379')
-:   Address and port of the redis server.
-timing_redis_prefix (default: 'sa-timing.')
-:   Prefix to used for the keys in redis.
-timing_redis_precision (default: 1000000)
-:   Since redis uses integers the floating point value is multiplied by this factor before storing in redis.
-timing_redis_debug (default: 0)
-:   Turn on/off debug on the Redis connection.
+## timing_redis_server (default: '127.0.0.1:6379')
+
+Address and port of the redis server.
+ 
+## timing_redis_prefix (default: 'sa-timing.')
+
+Prefix to used for the keys in redis.
+
+## timing_redis_precision (default: 1000000)
+
+Since redis uses integers the floating point value is multiplied by this factor before storing in redis.
+
+## timing_redis_debug (default: 0)
+
+Turn on/off debug on the Redis connection.
 
 # AUTHOR
 
