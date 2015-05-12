@@ -149,7 +149,9 @@ sub ran_rule {
 
 sub finish {
 	my $self = shift;
-	$self->{'redis'}->quit;
+	if( defined $self->{'redis'} ) {
+		$self->{'redis'}->quit;
+	}
 	return;
 }
 
