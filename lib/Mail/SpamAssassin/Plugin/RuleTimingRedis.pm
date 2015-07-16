@@ -6,6 +6,7 @@ use strict;
 use warnings;
 
 # ABSTRACT: collect SA rule timings in redis
+# VERSION
 
 =head1 DESCRIPTION
 
@@ -48,14 +49,42 @@ The plugin has the following configuration options:
 
 Address and port of the redis server.
 
+=item timing_redis_password (default: no password)
+
+Set if you redis server requires a password.
+
+=item timing_redis_exclude_re (default: '^__')
+
+Regex to exclude rules from timing statistics.
+
+The current SpamAssassin ruleset is about ~2k rules.
+The default will exclude all sub-rules that start with '__' (two underscores).
+
+Set to empty string if you really want to measure all rules.
+
 =item timing_redis_prefix (default: 'sa-timing.')
 
 Prefix to used for the keys in redis.
+
+=item timing_redis_database (default: 0)
+
+Will call SELECT to switch database after connect if set to a non-zero value.
+
+Database 0 is the default in redis.
 
 =item timing_redis_precision (default: 1000000)
 
 Since redis uses integers the floating point value is multiplied
 by this factor before storing in redis.
+
+=item timing_redis_bulk_update (default: 50)
+
+Will queue redis updates up to the configured value and execute them
+in bulks via a server-side script.
+
+Requires a redis server >= 2.6.0 and Redis perl module >= 1.954.
+
+Set to 0 to disable bulk.
 
 =item timing_redis_debug (default: 0)
 
@@ -72,6 +101,14 @@ use vars qw(@ISA);
 
 use Redis;
 
+our $BULK_SCRIPT = <<"EOT";
+for i=1,#KEYS do
+  redis.call('INCR', KEYS[i] .. ".count" )
+  redis.call('INCRBY', KEYS[i] .. ".time", ARGV[i] )
+end
+return #KEYS
+EOT
+
 sub new {
     my $class = shift;
     my $mailsaobject = shift;
@@ -86,13 +123,28 @@ sub new {
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
             default => '127.0.0.1:6379',
         }, {
+            setting => 'timing_redis_password',
+            type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
+        }, {
+            setting => 'timing_redis_exclude_re',
+            type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
+            default => '^__',
+        }, {
             setting => 'timing_redis_prefix',
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
             default => 'sa-timing.',
         }, {
+            setting => 'timing_redis_database',
+            type => $Mail::SpamAssassin::Conf::CONF_TYPE_NUMERIC,
+            default => 0,
+        }, {
             setting => 'timing_redis_precision',
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_NUMERIC,
             default => 1000000, # microseconds (millionths of a second)
+        }, {
+            setting => 'timing_redis_bulk_update',
+            type => $Mail::SpamAssassin::Conf::CONF_TYPE_NUMERIC,
+            default => 50,
         }, {
             setting => 'timing_redis_debug',
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_BOOL,
@@ -105,19 +157,61 @@ sub new {
 
 sub _get_redis {
     my $self = shift;
+    my $conf = $self->{main}->{conf};
+    my ( $server, $debug, $password, $database, $bulk ) =
+    	@$conf{ 'timing_redis_server','timing_redis_debug', 'timing_redis_password',
+		'timing_redis_database', 'timing_redis_bulk_update' };
 
     if( ! defined $self->{'_redis'} ) {
+	Mail::SpamAssassin::Plugin::info('initializing connection to redis server...');
         eval {
             $self->{'_redis'} = Redis->new(
-                'server' => $self->{main}->{conf}->{'timing_redis_server'},
-                'debug' => $self->{main}->{conf}->{'timing_redis_debug'},
+                'server' => $server,
+                'debug' => $debug,
+		defined $password ? ( password => $password ) : (),
             );
         };
         if( $@ ) {
             die('could not connect to redis: '.$@);
         }
+	if( $database ) {
+		Mail::SpamAssassin::Plugin::info("selecting redis database $database...");
+		$self->{'_redis'}->select($database);
+	}
+	if( $bulk ) {
+		Mail::SpamAssassin::Plugin::info("loading redis lua bulk script...");
+		$self->{'_script'} = $self->{'_redis'}->script_load($BULK_SCRIPT);
+		Mail::SpamAssassin::Plugin::dbg("script loaded as ".$self->{'_script'});
+	}
     }
     return $self->{'_redis'};
+}
+
+sub _flush_queue {
+    my ( $self, $queue ) = @_;
+    my $prefix = $self->{main}->{conf}->{'timing_redis_prefix'};
+
+    my $count = scalar @$queue;
+    if( ! $count ) {
+	    return;
+    }
+    Mail::SpamAssassin::Plugin::dbg("flushing $count timing events to redis...");
+    my @args;
+    push( @args, map { $prefix.$_->[0] } @$queue );
+    push( @args, map { $_->[1] } @$queue );
+
+    $self->{'_redis'}->evalsha(
+	    $self->{'_script'}, $count, @args, sub {});
+
+    @$queue = ();
+
+    return;
+}
+
+sub check_start {
+    my ($self, $options) = @_;
+    $options->{permsgstatus}->{'rule_timing_queue'} = [];
+    return;
 }
 
 sub start_rules {
@@ -129,9 +223,17 @@ sub start_rules {
 sub ran_rule {
     my $time = Time::HiRes::time();
     my ($self, $options) = @_;
+    my $exclude_re = $self->{main}->{conf}->{'timing_redis_exclude_re'};
+    my $bulk = $self->{main}->{conf}->{'timing_redis_bulk_update'};
+    my $queue = $options->{permsgstatus}->{'rule_timing_queue'};
 
     my $permsg = $options->{permsgstatus};
     my $name = $options->{rulename};
+    if( defined $exclude_re
+            && $exclude_re ne ''
+            &&  $name =~ /$exclude_re/ ) {
+        return;
+    }
     my $prefix = $self->{main}->{conf}->{'timing_redis_prefix'};
     my $precision = $self->{main}->{conf}->{'timing_redis_precision'};
 
@@ -140,12 +242,35 @@ sub ran_rule {
 
     my $redis = $self->_get_redis;
 
-    $redis->incrby($prefix.$name.'.time', $duration);
-    $redis->incr($prefix.$name.'.count');
+    if( $bulk )  {
+        push( @$queue, [ $name, $duration ] );
+
+	if( scalar @$queue >= $bulk ) {
+		$self->_flush_queue( $queue );
+	}
+    } else {
+        $redis->incrby($prefix.$name.'.time', $duration, sub {} );
+        $redis->incr($prefix.$name.'.count', sub {} );
+    }
 
     return;
 }
 
+sub check_end {
+    my ($self, $options) = @_;
+    my $bulk = $self->{main}->{conf}->{'timing_redis_bulk_update'};
+    my $queue = $options->{permsgstatus}->{'rule_timing_queue'};
+
+    my $redis = $self->_get_redis;
+    if( $bulk ) {
+        Mail::SpamAssassin::Plugin::dbg("cleaning up redis timing queue (".scalar(@$queue)." left)...");
+        $self->_flush_queue( $queue );
+    }
+    Mail::SpamAssassin::Plugin::dbg("waiting for redis pipelined responses...");
+    $redis->wait_all_responses;
+
+    return;
+}
 
 sub finish {
 	my $self = shift;
