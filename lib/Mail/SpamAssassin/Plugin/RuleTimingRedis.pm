@@ -2,6 +2,8 @@ package Mail::SpamAssassin::Plugin::RuleTimingRedis;
 
 use Mail::SpamAssassin::Plugin;
 use Mail::SpamAssassin::Logger;
+use Mail::SpamAssassin::Util qw( untaint_var );
+
 use strict;
 use warnings;
 
@@ -120,33 +122,41 @@ sub new {
     $mailsaobject->{conf}->{parser}->register_commands( [
         {
             setting => 'timing_redis_server',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
             default => '127.0.0.1:6379',
         }, {
             setting => 'timing_redis_password',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
         }, {
             setting => 'timing_redis_exclude_re',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
             default => '^__',
         }, {
             setting => 'timing_redis_prefix',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_STRING,
             default => 'sa-timing.',
         }, {
             setting => 'timing_redis_database',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_NUMERIC,
             default => 0,
         }, {
             setting => 'timing_redis_precision',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_NUMERIC,
             default => 1000000, # microseconds (millionths of a second)
         }, {
             setting => 'timing_redis_bulk_update',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_NUMERIC,
             default => 50,
         }, {
             setting => 'timing_redis_debug',
+            is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_BOOL,
             default => 0,
         },
@@ -161,6 +171,8 @@ sub _get_redis {
     my ( $server, $debug, $password, $database, $bulk ) =
     	@$conf{ 'timing_redis_server','timing_redis_debug', 'timing_redis_password',
 		'timing_redis_database', 'timing_redis_bulk_update' };
+
+    untaint_var( \$server );
 
     if( ! defined $self->{'_redis'} ) {
 	Mail::SpamAssassin::Plugin::info('initializing connection to redis server...');
