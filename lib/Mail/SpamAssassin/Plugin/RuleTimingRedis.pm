@@ -244,27 +244,28 @@ sub ran_rule {
     if( defined $exclude_re
             && $exclude_re ne ''
             &&  $name =~ /$exclude_re/ ) {
+        $permsg->{'rule_timing_start'} = Time::HiRes::time();
         return;
     }
     my $prefix = $self->{main}->{conf}->{'timing_redis_prefix'};
     my $precision = $self->{main}->{conf}->{'timing_redis_precision'};
 
     my $duration = int(($time - $permsg->{'rule_timing_start'}) * $precision);
-    $permsg->{'rule_timing_start'} = $time;
 
     my $redis = $self->_get_redis;
 
     if( $bulk )  {
         push( @$queue, [ $name, $duration ] );
 
-	if( scalar @$queue >= $bulk ) {
-		$self->_flush_queue( $queue );
-	}
+        if( scalar @$queue >= $bulk ) {
+            $self->_flush_queue( $queue );
+        }
     } else {
         $redis->incrby($prefix.$name.'.time', $duration, sub {} );
         $redis->incr($prefix.$name.'.count', sub {} );
     }
 
+    $permsg->{'rule_timing_start'} = Time::HiRes::time();
     return;
 }
 
