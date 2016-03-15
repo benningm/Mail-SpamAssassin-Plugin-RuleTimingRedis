@@ -92,6 +92,18 @@ Set to 0 to disable bulk.
 
 Turn on/off debug on the Redis connection.
 
+=item timing_redis_hits_enabled (default: 0)
+
+If enabled for each test that matched an counter will
+be incremented in the redis database.
+
+  127.0.0.1:6379> keys *.hits
+   1) "sa-timing.MISSING_SUBJECT.hits"
+   2) "sa-timing.MISSING_MID.hits"
+   3) "sa-timing.NO_RELAYS.hits"
+  127.0.0.1:6379> GET "sa-timing.MISSING_SUBJECT.hits"
+  "3"
+
 =back
 
 =cut
@@ -103,10 +115,16 @@ use vars qw(@ISA);
 
 use Redis;
 
-our $BULK_SCRIPT = <<"EOT";
+our $BULK_TIMING_SCRIPT = <<"EOT";
 for i=1,#KEYS do
   redis.call('INCR', KEYS[i] .. ".count" )
   redis.call('INCRBY', KEYS[i] .. ".time", ARGV[i] )
+end
+return #KEYS
+EOT
+our $BULK_MINCR_SCRIPT = <<"EOT";
+for i=1,#KEYS do
+  redis.call('INCR', KEYS[i] )
 end
 return #KEYS
 EOT
@@ -159,6 +177,11 @@ sub new {
             is_admin => 1,
             type => $Mail::SpamAssassin::Conf::CONF_TYPE_BOOL,
             default => 0,
+        }, {
+            setting => 'timing_redis_hits_enabled',
+            is_admin => 1,
+            type => $Mail::SpamAssassin::Conf::CONF_TYPE_BOOL,
+            default => 0,
         },
     ] );
 
@@ -192,8 +215,10 @@ sub _get_redis {
 	}
 	if( $bulk ) {
 		Mail::SpamAssassin::Plugin::info("loading redis lua bulk script...");
-		$self->{'_script'} = $self->{'_redis'}->script_load($BULK_SCRIPT);
-		Mail::SpamAssassin::Plugin::dbg("script loaded as ".$self->{'_script'});
+		$self->{'_timing_script'} = $self->{'_redis'}->script_load($BULK_TIMING_SCRIPT);
+		$self->{'_mincr_script'} = $self->{'_redis'}->script_load($BULK_MINCR_SCRIPT);
+		Mail::SpamAssassin::Plugin::dbg("scripts loaded as ".$self->{'_timing_script'}
+      .' and '.$self->{'_mincr_script'});
 	}
     }
     return $self->{'_redis'};
@@ -213,7 +238,7 @@ sub _flush_queue {
     push( @args, map { $_->[1] } @$queue );
 
     $self->{'_redis'}->evalsha(
-	    $self->{'_script'}, $count, @args, sub {});
+	    $self->{'_timing_script'}, $count, @args, sub {});
 
     @$queue = ();
 
@@ -271,14 +296,30 @@ sub ran_rule {
 
 sub check_end {
     my ($self, $options) = @_;
+    my $prefix = $self->{main}->{conf}->{'timing_redis_prefix'};
     my $bulk = $self->{main}->{conf}->{'timing_redis_bulk_update'};
-    my $queue = $options->{permsgstatus}->{'rule_timing_queue'};
+    my $hits_enabled = $self->{main}->{conf}->{'timing_redis_hits_enabled'};
+    my $pms = $options->{permsgstatus};
+    my $queue = $pms->{'rule_timing_queue'};
 
     my $redis = $self->_get_redis;
     if( $bulk ) {
-        Mail::SpamAssassin::Plugin::dbg("cleaning up redis timing queue (".scalar(@$queue)." left)...");
-        $self->_flush_queue( $queue );
+      Mail::SpamAssassin::Plugin::dbg("cleaning up redis timing queue (".scalar(@$queue)." left)...");
+      $self->_flush_queue( $queue );
     }
+    if( $hits_enabled && $bulk ) {
+      my @tests = map { $prefix.$_.'.hits' }
+        split(',', $pms->get_names_of_tests_hit);
+      if( $bulk ) {
+        $self->{'_redis'}->evalsha(
+    	    $self->{'_mincr_script'}, scalar(@tests), @tests, sub {});
+      } else {
+        foreach my $test ( @tests ) {
+          $self->{'_redis'}->incr($test, sub {} );
+        }
+      }
+    }
+
     Mail::SpamAssassin::Plugin::dbg("waiting for redis pipelined responses...");
     $redis->wait_all_responses;
 
